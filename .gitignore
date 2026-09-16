@@ -1,0 +1,17 @@
+node_modules/
+.expo/
+.expo-shared/
+
+# Local installers
+nvm-setup.exe
+
+# Old/source backup packages
+*.zip
+src-rs232 position+msg fix/
+
+# Logs / local environment
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+.env
