@@ -10,6 +10,166 @@ import COLORS from '../colors';
 import { SocketContext } from '../helpers/SocketContext';
 import { setEmergency } from '../redux/ducks/auto';
 
+
+/*
+ * Position traffic can arrive much faster than the display can physically
+ * paint. Keep that hot path inside this small child component.
+ *
+ * - no periodic timer
+ * - no background polling
+ * - no hidden-screen position listener
+ * - at most one position render per browser animation frame
+ */
+const LivePositionMetrics = React.memo(() => {
+    const socket = useContext(SocketContext);
+    const { jog } = useSelector(state => state.auto);
+
+    const [position, setPosition] = React.useState({
+        pos: '',
+        dest: ''
+    });
+
+    const latestPosRef = useRef('');
+    const latestDestRef = useRef('');
+    const frameRef = useRef(null);
+    const lastPaintAtRef = useRef(0);
+
+    /*
+     * HMI DISPLAY THROTTLE ONLY.
+     *
+     * Machine control / EtherCAT / backend polling remain unchanged.
+     *
+     * During continuous JOG, position changes nonstop. Updating the
+     * React/Chromium display for every packet heats the Pi.
+     *
+     * jog=true  -> max 4 FPS, one update every 250 ms
+     * jog=false -> max 12 FPS, one update every 80 ms
+     */
+    const getMinPaintInterval = useCallback(() => {
+        return jog ? 250 : 80;
+    }, [jog]);
+
+    const flushPosition = useCallback(() => {
+        if (frameRef.current !== null) {
+            return;
+        }
+
+        const paint = (timestamp) => {
+            const minInterval = getMinPaintInterval();
+            const elapsed = timestamp - lastPaintAtRef.current;
+
+            if (elapsed < minInterval) {
+                frameRef.current = requestAnimationFrame(paint);
+                return;
+            }
+
+            frameRef.current = null;
+            lastPaintAtRef.current = timestamp;
+
+            const nextPos = latestPosRef.current;
+            const nextDest = latestDestRef.current;
+
+            setPosition(current => {
+                if (
+                    current.pos === nextPos &&
+                    current.dest === nextDest
+                ) {
+                    return current;
+                }
+
+                return {
+                    pos: nextPos,
+                    dest: nextDest
+                };
+            });
+        };
+
+        frameRef.current = requestAnimationFrame(paint);
+    }, [getMinPaintInterval]);
+
+    const handlePos = useCallback(data => {
+        if (
+            !data ||
+            data.data === undefined
+        ) {
+            return;
+        }
+
+        latestPosRef.current = data.data;
+        flushPosition();
+    }, [flushPosition]);
+
+    const handleDest = useCallback(data => {
+        if (
+            !data ||
+            data.pos === undefined
+        ) {
+            return;
+        }
+
+        latestDestRef.current = data.pos;
+        flushPosition();
+    }, [flushPosition]);
+
+    useFocusEffect(
+        useCallback(() => {
+            socket.on("pos_data", handlePos);
+            socket.on("destination_position", handleDest);
+
+            return () => {
+                socket.off("pos_data", handlePos);
+                socket.off("destination_position", handleDest);
+
+                if (frameRef.current !== null) {
+                    cancelAnimationFrame(frameRef.current);
+                    frameRef.current = null;
+                }
+            };
+        }, [socket, handlePos, handleDest])
+    );
+
+    return (
+        <View style={styles.stats3}>
+            <View style={styles.statsPositionColumn}>
+                <View style={styles.statsMetricValueSlot}>
+                    <View style={styles.statsPositionValueBox}>
+                        <Text style={styles.statsPositionValueText}>
+                            {position.dest}
+                        </Text>
+                    </View>
+                </View>
+
+                <Text
+                    numberOfLines={1}
+                    style={styles.statsMetricLabel}
+                >
+                    ACTUAL POSITION
+                </Text>
+            </View>
+
+            <View style={styles.statsPositionDivider} />
+
+            <View style={styles.statsPositionColumn}>
+                <View style={styles.statsMetricValueSlot}>
+                    <View style={styles.statsPositionValueBox}>
+                        <Text style={styles.statsPositionValueText}>
+                            {position.pos}
+                        </Text>
+                    </View>
+                </View>
+
+                <Text
+                    numberOfLines={1}
+                    style={styles.statsMetricLabel}
+                >
+                    DESTINATION
+                </Text>
+            </View>
+        </View>
+    );
+});
+
+
 const Stats = ({ navigation, location }) => {
     const socket = useContext(SocketContext);
     const { emergency, reset, zeroref } = useSelector(state => state.auto);
@@ -18,13 +178,11 @@ const Stats = ({ navigation, location }) => {
     const [error, setError] = React.useState(false);
     const [status, setStatus] = React.useState(false);
     const [fault, setFault] = React.useState(false);
-    const [ethercatA, setEthercatA] = React.useState(false);
     const [msg, setMsg] = React.useState('No Errors');
 
     /*
-     * Keep all live I/O values in one state object so one io_status
-     * packet produces at most one React state update/render.
-     * Values are kept exactly as received from the backend.
+     * I/O remains event-driven exactly as before.
+     * React only receives a new object if at least one bit changed.
      */
     const [ioStatus, setIoStatus] = React.useState({
         ecs: false,
@@ -39,21 +197,16 @@ const Stats = ({ navigation, location }) => {
         not: false
     });
 
-    const [pos, setPos] = React.useState('');
-    const [dest, setDest] = React.useState('');
     const [driveError, setDriveError] = React.useState('0');
 
     const dispatch = useDispatch();
 
-    /*
-     * Stable socket handlers must still read the latest UI/Redux values.
-     * Refs let the callbacks stay stable without changing existing logic.
-     */
     const errorRef = useRef(error);
     const statusRef = useRef(status);
     const emergencyRef = useRef(emergency);
     const resetRef = useRef(reset);
     const zerorefRef = useRef(zeroref);
+    const lastAlarmRef = useRef(null);
 
     errorRef.current = error;
     statusRef.current = status;
@@ -61,19 +214,31 @@ const Stats = ({ navigation, location }) => {
     resetRef.current = reset;
     zerorefRef.current = zeroref;
 
-    const handleAlarm = useCallback((data) => {
+    const handleAlarm = useCallback(data => {
+        /*
+         * Repeated identical alarm packets do not need to repaint the HMI.
+         */
+        if (lastAlarmRef.current === data) {
+            return;
+        }
+
+        lastAlarmRef.current = data;
+
         if (data == 'No Alarms') {
             setError(false);
             setFault(false);
             setMsg(data);
-            setDriveError('0'); // Reset drive error to 0
+            setDriveError('0');
         }
         else {
             setMsg(data);
             setFault(true);
 
-            // Extract number from the alarm message for the drive error display
-            const errorCode = data.match(/\d+/) || ['0'];
+            const errorCode =
+                typeof data === 'string'
+                    ? (data.match(/\d+/) || ['0'])
+                    : ['0'];
+
             setDriveError(errorCode[0]);
 
             if (!errorRef.current && !statusRef.current) {
@@ -81,13 +246,7 @@ const Stats = ({ navigation, location }) => {
             }
         }
     }, []);
-    const handlePos = useCallback(data => setPos(data.data), []);
-    const handleDest = useCallback(data => setDest(data.pos), []);
-    const handleDriver = useCallback(data => {
-        if (data.drive_name == 'A') {
-            setEthercatA(data.status == 1 ? true : false);
-        }
-    }, []);
+
     const handleIO = useCallback(data => {
         if (!data || !data.ioStat) {
             return;
@@ -126,19 +285,39 @@ const Stats = ({ navigation, location }) => {
         });
     }, []);
 
-    const handleDriveError = useCallback(data => setDriveError(data.code), []);
+    const handleDriveError = useCallback(data => {
+        if (
+            !data ||
+            data.code === undefined
+        ) {
+            return;
+        }
+
+        const nextCode = String(data.code);
+
+        setDriveError(current => {
+            if (current === nextCode) {
+                return current;
+            }
+
+            return nextCode;
+        });
+    }, []);
+
     const handleSend = useCallback((ev, req) => {
         socket.emit(ev, req);
     }, [socket]);
 
     const handleEnableEmergency = useCallback(() => {
-        dispatch(setEmergency(false, resetRef.current, zerorefRef.current))
+        dispatch(setEmergency(false, resetRef.current, zerorefRef.current));
     }, [dispatch]);
+
     const handleEnableReset = useCallback(() => {
-        dispatch(setEmergency(false, false, false))
+        dispatch(setEmergency(false, false, false));
     }, [dispatch]);
+
     const handleEnableZeroref = useCallback(() => {
-        dispatch(setEmergency(emergencyRef.current, resetRef.current, false))
+        dispatch(setEmergency(emergencyRef.current, resetRef.current, false));
     }, [dispatch]);
 
     useFocusEffect(
@@ -150,31 +329,52 @@ const Stats = ({ navigation, location }) => {
         }, [])
     );
 
-    useEffect(() => {
-        socket.on("alarm_error", handleAlarm);
-        socket.on("pos_data", handlePos);
-        socket.on("destination_position", handleDest);
-        socket.on("io_status", handleIO);
-        socket.on("driver_status", handleDriver);
-        socket.on("drive_error_code", handleDriveError);
+    /*
+     * Heavy DISPLAY listeners are active only for the currently visible
+     * screen. Hidden Manual/Auto/Program/Settings screens no longer consume
+     * continuous I/O/alarm/drive-error packets.
+     *
+     * driver_status was removed here because ethercatA was never rendered.
+     */
+    useFocusEffect(
+        useCallback(() => {
+            socket.on("alarm_error", handleAlarm);
+            socket.on("io_status", handleIO);
+            socket.on("drive_error_code", handleDriveError);
 
+            return () => {
+                socket.off("alarm_error", handleAlarm);
+                socket.off("io_status", handleIO);
+                socket.off("drive_error_code", handleDriveError);
+            };
+        }, [
+            socket,
+            handleAlarm,
+            handleIO,
+            handleDriveError
+        ])
+    );
+
+    /*
+     * Keep rare command-completion events mounted as before so safety/UI
+     * synchronization is not dependent on a position/display optimization.
+     */
+    useEffect(() => {
         socket.on("gotozero_done", handleEnableZeroref);
         socket.on("emergency_done", handleEnableEmergency);
         socket.on("reset_done", handleEnableReset);
 
         return () => {
-            socket.off("alarm_error", handleAlarm);
-            socket.off("pos_data", handlePos);
-            socket.off("destination_position", handleDest);
-            socket.off("io_status", handleIO);
-            socket.off("driver_status", handleDriver);
-            socket.off("drive_error_code", handleDriveError);
-
             socket.off("gotozero_done", handleEnableZeroref);
             socket.off("emergency_done", handleEnableEmergency);
             socket.off("reset_done", handleEnableReset);
         };
-    }, [socket, handleAlarm, handlePos, handleDest, handleIO, handleDriver, handleDriveError, handleEnableZeroref, handleEnableEmergency, handleEnableReset]);
+    }, [
+        socket,
+        handleEnableZeroref,
+        handleEnableEmergency,
+        handleEnableReset
+    ]);
 
     return (
         <>
@@ -182,11 +382,6 @@ const Stats = ({ navigation, location }) => {
                 colors={['#2d2c2d', '#000']}
                 style={styles.statsWrap}
             >
-                {/*
-                 * =====================================================
-                 * MANUAL / PROGRAM / AUTO / SETTINGS
-                 * =====================================================
-                 */}
                 <View style={styles.stats1}>
                     {location == 'MANUAL' && <Image source={require('../img/home/manual.png')} style={styles.icnStatMain} />}
                     {location == 'PROGRAM' && <Image source={require('../img/home/program.png')} style={styles.icnStatMain} />}
@@ -198,12 +393,6 @@ const Stats = ({ navigation, location }) => {
                     </Text>
                 </View>
 
-                {/*
-                 * =====================================================
-                 * AXIS
-                 * VALUE ABOVE / HEADER BELOW
-                 * =====================================================
-                 */}
                 <View style={styles.stats2}>
                     <View style={styles.statsMetricColumn}>
                         <View style={styles.statsMetricValueSlot}>
@@ -223,56 +412,8 @@ const Stats = ({ navigation, location }) => {
                     </View>
                 </View>
 
-                {/*
-                 * =====================================================
-                 * ACTUAL POSITION / DESTINATION
-                 * VALUES ABOVE / HEADERS BELOW
-                 * BOTH HEADERS SHARE THE SAME BASELINE
-                 * =====================================================
-                 */}
-                <View style={styles.stats3}>
-                    <View style={styles.statsPositionColumn}>
-                        <View style={styles.statsMetricValueSlot}>
-                            <View style={styles.statsPositionValueBox}>
-                                <Text style={styles.statsPositionValueText}>
-                                    {dest}
-                                </Text>
-                            </View>
-                        </View>
+                <LivePositionMetrics />
 
-                        <Text
-                            numberOfLines={1}
-                            style={styles.statsMetricLabel}
-                        >
-                            ACTUAL POSITION
-                        </Text>
-                    </View>
-
-                    <View style={styles.statsPositionDivider} />
-
-                    <View style={styles.statsPositionColumn}>
-                        <View style={styles.statsMetricValueSlot}>
-                            <View style={styles.statsPositionValueBox}>
-                                <Text style={styles.statsPositionValueText}>
-                                    {pos}
-                                </Text>
-                            </View>
-                        </View>
-
-                        <Text
-                            numberOfLines={1}
-                            style={styles.statsMetricLabel}
-                        >
-                            DESTINATION
-                        </Text>
-                    </View>
-                </View>
-
-                {/*
-                 * =====================================================
-                 * DRIVE ERROR
-                 * =====================================================
-                 */}
                 <View style={styles.statsDrive}>
                     <View style={styles.statsMetricColumn}>
                         <View style={styles.statsMetricValueSlot}>
@@ -292,12 +433,6 @@ const Stats = ({ navigation, location }) => {
                     </View>
                 </View>
 
-                {/*
-                 * =====================================================
-                 * FAULT / I-O
-                 * STATUS ABOVE / HEADER BELOW
-                 * =====================================================
-                 */}
                 <View style={styles.stats4}>
                     <TouchableOpacity
                         onPress={() => {
@@ -342,12 +477,6 @@ const Stats = ({ navigation, location }) => {
                     </TouchableOpacity>
                 </View>
 
-                {/*
-                 * =====================================================
-                 * EMERGENCY / RESET
-                 * EXISTING LOGIC UNCHANGED
-                 * =====================================================
-                 */}
                 <View style={styles.stats5}>
                     <TouchableOpacity
                         style={[
@@ -453,7 +582,6 @@ const Stats = ({ navigation, location }) => {
                 </View>
             </LinearGradient>
 
-
             {status &&
                 <Animatable.View style={styles.modalWrap} animation="slideInUp" duration={300}>
                     <LinearGradient colors={[COLORS.modal1, COLORS.modal2]} style={styles.w100p}>
@@ -514,7 +642,6 @@ const Stats = ({ navigation, location }) => {
                     </LinearGradient>
                 </Animatable.View>}
 
-
             {error &&
                 <Animatable.View style={styles.modalWrap} animation="slideInUp" duration={300}>
                     <LinearGradient colors={[COLORS.modal1, COLORS.modal2]} style={styles.w100p}>
@@ -547,4 +674,4 @@ const Stats = ({ navigation, location }) => {
     );
 };
 
-export default Stats;
+export default React.memo(Stats);

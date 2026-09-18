@@ -1,5 +1,19 @@
-import React, { useContext, useState, useCallback, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, ImageBackground, Dimensions } from 'react-native';
+import React, {
+  useContext,
+  useState,
+  useCallback,
+  useEffect,
+  useRef
+} from 'react';
+
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  ImageBackground,
+  Dimensions
+} from 'react-native';
+
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -12,716 +26,1626 @@ import styles from '../../styles';
 import COLORS from '../../colors';
 import { SocketContext } from '../../helpers/SocketContext';
 
-import { setEmergency, setJog } from '../../redux/ducks/auto';
+import {
+  setEmergency,
+  setJog
+} from '../../redux/ducks/auto';
 
 import Stats from '../../components/Stats';
 import api from '../../helpers/Api';
+
 import JogSpeedometer from './JogSpeedometer';
+import ContinuousJogPanel from './ContinuousJogPanel';
+
+
+/*
+ * Keep false on production HMI.
+ * Prevents console spam from adding load to Chromium.
+ */
+const DEBUG_MANUAL_JOG = false;
+
+const manualLog = (...args) => {
+  if (DEBUG_MANUAL_JOG) {
+    console.log(...args);
+  }
+};
+
 
 const Manual = ({ navigation }) => {
-  const socket = useContext(SocketContext);
 
-  const [mode, setMode] = useState('JOG');
-  const [position, setPosition] = useState(0.1);
+  const socket =
+    useContext(SocketContext);
+
+  const dispatch =
+    useDispatch();
+
 
   /*
-   * Physical arrow identifier:
+   * ============================================================
+   * EXISTING MANUAL MODE STATE
+   * ============================================================
+   */
+
+  const [mode, setMode] =
+    useState('JOG');
+
+  const [position, setPosition] =
+    useState(0.1);
+
+  /*
+   * Physical arrow contract remains unchanged.
+   *
    * LEFT  = 1
    * RIGHT = 0
+   *
+   * Backend handles motor polarity.
    */
-  const [direction, setDirection] = useState(1);
+  const [direction, setDirection] =
+    useState(1);
+
+  const [motorDir, setMotorDir] =
+    useState(1);
 
   /*
-   * Machine Parameter motor_dir:
+   * Jog feed remains LOCAL frontend state.
    *
-   * Loaded here for diagnostics/UI visibility only.
-   *
-   * Direction polarity itself is applied ONCE by the backend
-   * using the active drive's reverse/nonreverse configuration.
-   *
-   * Frontend physical arrow contract always remains:
-   * LEFT  = 1
-   * RIGHT = 0
+   * Machine Parameter gives initial value.
+   * Value is sent with jog_mode START.
    */
-  const [motorDir, setMotorDir] = useState(1);
+  const [jogFeed, setJogFeed] =
+    useState(1);
+
+  const [jogPressed, setJogPressed] =
+    useState(null);
+
+  const [stepPressed, setStepPressed] =
+    useState(null);
+
+  const [action, setAction] =
+    useState(0);
+
+  const [modal, setModal] =
+    useState(false);
+
+  const [moving, setMoving] =
+    useState(false);
+
+  const [loading, setLoading] =
+    useState(false);
+
+  const [zeroRef, setZeroRef] =
+    useState(true);
+
+
+  const {
+    running,
+    jog,
+    emergency,
+    reset,
+    zeroref
+  } =
+    useSelector(
+      state => state.auto
+    );
+
 
   /*
-   * Manual Jog Feed:
-   * integer range 0..20, step 1.
-   * Sent live with jog_mode START.
+   * ============================================================
+   * EXISTING JOG REFERENCES
+   * ============================================================
+   *
+   * These refs describe ACTUAL motion request state.
+   *
+   * They are used for both:
+   *
+   * 1. Existing normal hold-to-run jog.
+   * 2. New continuous latched jog.
    */
-  const [jogFeed, setJogFeed] = useState(1);
+
+  const jogActiveRef =
+    useRef(false);
+
+  const jogDirectionRef =
+    useRef(null);
+
 
   /*
-   * Temporary arrow highlight states.
-   *
-   * JOG:
-   * blue only while the arrow is physically held.
-   *
-   * STEP:
-   * blue only while the arrow is physically pressed.
+   * ============================================================
+   * NEW CONTINUOUS JOG STATE
+   * ============================================================
    */
-  const [jogPressed, setJogPressed] = useState(null);
-  const [stepPressed, setStepPressed] = useState(null);
 
-  const [action, setAction] = useState(0);
-  const [modal, setModal] = useState(false);
-
-  const dispatch = useDispatch();
-
-  const [moving, setMoving] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [zeroRef, setZeroRef] = useState(true);
-
-  const { running, jog, emergency, reset, zeroref } = useSelector(state => state.auto);
+  const [
+    continuousJogEnabled,
+    setContinuousJogEnabled
+  ] =
+    useState(false);
 
   /*
-   * JOG safety refs.
-   *
-   * jogActiveRef:
-   * true only while a hold-to-jog command is active.
-   *
-   * jogDirectionRef:
-   * stores the ACTUAL direction sent to backend so STOP
-   * always matches the corresponding START.
+   * null = stopped
+   * 1    = LEFT active
+   * 0    = RIGHT active
    */
-  const jogActiveRef = useRef(false);
-  const jogDirectionRef = useRef(null);
+  const [
+    continuousJogDirection,
+    setContinuousJogDirection
+  ] =
+    useState(null);
 
   /*
-   * UI performance only: throttle outbound Jog Feed mirror packets while
-   * dragging. The local knob still updates immediately on every valid
-   * touch value, and the latest value is always sent as a trailing update.
+   * Refs prevent stale responder callbacks and avoid unnecessary renders.
    */
-  const JOG_FEED_MIRROR_INTERVAL_MS = 50;
-  const lastJogFeedMirrorAtRef = useRef(0);
-  const pendingJogFeedMirrorRef = useRef(null);
-  const jogFeedMirrorTimerRef = useRef(null);
+  const continuousJogEnabledRef =
+    useRef(false);
 
-  const handleSend = useCallback((ev, req) => {
-    socket.emit(ev, req);
-  }, [socket]);
+  const continuousJogDirectionRef =
+    useRef(null);
 
-  const emitJogFeedMirror = useCallback((value) => {
-    const now = Date.now();
-    const elapsed = now - lastJogFeedMirrorAtRef.current;
 
-    pendingJogFeedMirrorRef.current = value;
+  /*
+   * ============================================================
+   * COMMON SOCKET SEND
+   * ============================================================
+   */
 
-    if (
-      lastJogFeedMirrorAtRef.current === 0 ||
-      elapsed >= JOG_FEED_MIRROR_INTERVAL_MS
-    ) {
-      if (jogFeedMirrorTimerRef.current) {
-        clearTimeout(jogFeedMirrorTimerRef.current);
-        jogFeedMirrorTimerRef.current = null;
-      }
+  const handleSend =
+    useCallback(
+      (ev, req) => {
+        socket.emit(
+          ev,
+          req
+        );
+      },
+      [socket]
+    );
 
-      lastJogFeedMirrorAtRef.current = now;
-      pendingJogFeedMirrorRef.current = null;
 
-      socket.emit(
-        'set_jog_feed',
-        {
-          jog_feed: value
-        }
-      );
+  /*
+   * ============================================================
+   * JOG FEED
+   * ============================================================
+   */
 
-      return;
-    }
+  const handleJogFeedChange =
+    useCallback(
+      (newJogFeed) => {
 
-    if (!jogFeedMirrorTimerRef.current) {
-      const wait = JOG_FEED_MIRROR_INTERVAL_MS - elapsed;
+        const safeJogFeed =
+          Number(
+            Number(
+              newJogFeed
+            ).toFixed(6)
+          );
 
-      jogFeedMirrorTimerRef.current = setTimeout(() => {
-        jogFeedMirrorTimerRef.current = null;
-
-        const pendingValue = pendingJogFeedMirrorRef.current;
-        pendingJogFeedMirrorRef.current = null;
-
-        if (pendingValue === null) {
+        if (
+          Number.isNaN(
+            safeJogFeed
+          ) ||
+          safeJogFeed < 0 ||
+          safeJogFeed > 20
+        ) {
           return;
         }
 
-        lastJogFeedMirrorAtRef.current = Date.now();
+        setJogFeed(
+          currentJogFeed => {
 
-        socket.emit(
-          'set_jog_feed',
-          {
-            jog_feed: pendingValue
+            if (
+              currentJogFeed ===
+              safeJogFeed
+            ) {
+              return currentJogFeed;
+            }
+
+            return safeJogFeed;
           }
         );
-      }, wait);
-    }
-  }, [socket]);
+      },
+      []
+    );
 
-  useEffect(() => {
-    return () => {
-      if (jogFeedMirrorTimerRef.current) {
-        clearTimeout(jogFeedMirrorTimerRef.current);
-        jogFeedMirrorTimerRef.current = null;
-      }
-    };
-  }, []);
 
   /*
-   * =====================================================
-   * SHARED JOG FEED SYNC
-   * =====================================================
-   * Backend mirrors only the selected speed value between
-   * connected Manual screens. Motion START/STOP is NOT
-   * mirrored and remains local hold-to-run behavior.
+   * Backend applies motor polarity.
+   * Frontend NEVER double-inverts.
    */
-  useEffect(() => {
-    const handleJogFeedUpdate = (data) => {
-      if (
-        !data ||
-        data.jog_feed === undefined ||
-        data.jog_feed === null
-      ) {
-        return;
-      }
+  const getActualDirection =
+    useCallback(
+      (arrowDir) => {
+        return arrowDir;
+      },
+      []
+    );
 
-      const value = Number(data.jog_feed);
 
-      if (
-        Number.isNaN(value) ||
-        value < 0 ||
-        value > 20
-      ) {
-        return;
-      }
+  /*
+   * ============================================================
+   * NORMAL JOG
+   * ============================================================
+   *
+   * THIS IS YOUR EXISTING BEHAVIOUR.
+   *
+   * Continuous Jog OFF:
+   *
+   * finger DOWN = START
+   * finger HOLD = keep running
+   * finger UP   = STOP
+   *
+   * This logic is deliberately preserved.
+   */
 
-      console.log(
-        '[MANUAL-JOG-SYNC] received jog_feed=',
-        value
-      );
+  const startJog =
+    useCallback(
+      (arrowDir) => {
 
-      const nextJogFeed =
-        Number(
-          value.toFixed(6)
-        );
-
-      setJogFeed(currentJogFeed => {
-        if (currentJogFeed === nextJogFeed) {
-          return currentJogFeed;
+        if (
+          mode !== 'JOG'
+        ) {
+          return;
         }
 
-        return nextJogFeed;
-      });
-    };
+        if (
+          zeroref ||
+          emergency ||
+          reset
+        ) {
+          return;
+        }
 
-    socket.on(
-      'jog_feed_update',
-      handleJogFeedUpdate
+        /*
+         * Normal hold-jog must never start while Continuous Jog mode
+         * is enabled.
+         */
+        if (
+          continuousJogEnabledRef.current
+        ) {
+          return;
+        }
+
+        /*
+         * Prevent duplicate START packets while finger remains held.
+         */
+        if (
+          jogActiveRef.current
+        ) {
+          return;
+        }
+
+        const actualDir =
+          getActualDirection(
+            arrowDir
+          );
+
+        jogActiveRef.current =
+          true;
+
+        jogDirectionRef.current =
+          actualDir;
+
+        setJogPressed(
+          arrowDir === 1
+            ? 'LEFT'
+            : 'RIGHT'
+        );
+
+        setDirection(
+          arrowDir
+        );
+
+        manualLog(
+          '[MANUAL-JOG] START',
+          'motor_dir=',
+          motorDir,
+          'arrow=',
+          arrowDir === 1
+            ? 'LEFT'
+            : 'RIGHT',
+          'sent_dir=',
+          actualDir,
+          'jog_feed=',
+          jogFeed
+        );
+
+        /*
+         * EXACT existing backend contract.
+         */
+        handleSend(
+          'jog_mode',
+          {
+            "dir": actualDir,
+            "action": 1,
+            "jog_feed": jogFeed
+          }
+        );
+
+        dispatch(
+          setJog(true)
+        );
+
+        setAction(1);
+      },
+      [
+        mode,
+        zeroref,
+        emergency,
+        reset,
+        motorDir,
+        jogFeed,
+        getActualDirection,
+        handleSend,
+        dispatch
+      ]
     );
 
-    return () => {
-      socket.off(
-        'jog_feed_update',
-        handleJogFeedUpdate
-      );
-    };
-  }, [socket]);
 
   /*
-   * =====================================================
-   * GENERIC DRIVE DIRECTION CONTRACT
-   * =====================================================
+   * ============================================================
+   * COMMON JOG STOP
+   * ============================================================
    *
-   * The frontend always sends the PHYSICAL arrow identity:
+   * Used by both:
    *
-   * LEFT  = 1
-   * RIGHT = 0
-   *
-   * Machine Parameter motor_dir is applied once by the
-   * backend/active drive configuration through that drive's
-   * reverse/nonreverse operation (0x607E where supported).
-   *
-   * IMPORTANT:
-   * Do NOT invert direction again in the frontend.
-   * Doing so causes a double inversion on drives whose
-   * 0x607E polarity is already configured by the backend.
+   * normal hold-to-run jog
+   * continuous jog
    */
-  const getActualDirection = useCallback((arrowDir) => {
-    return arrowDir;
-  }, []);
 
-  /*
-   * =====================================================
-   * JOG - HOLD ARROW TO RUN
-   * =====================================================
-   *
-   * Finger DOWN  -> START JOG
-   * Finger HELD  -> KEEP JOGGING
-   * Finger UP    -> STOP JOG
-   */
-  const startJog = useCallback((arrowDir) => {
-    if (mode !== 'JOG') {
-      return;
-    }
+  const stopJog =
+    useCallback(
+      (reason = 'UNKNOWN') => {
 
-    if (zeroref || emergency || reset) {
-      return;
-    }
+        if (
+          !jogActiveRef.current
+        ) {
 
-    /*
-     * Prevent duplicate START commands.
-     */
-    if (jogActiveRef.current) {
-      return;
-    }
+          setJogPressed(null);
 
-    const actualDir = getActualDirection(arrowDir);
+          continuousJogDirectionRef.current =
+            null;
 
-    /*
-     * Mark active before state updates/socket emit.
-     */
-    jogActiveRef.current = true;
-    jogDirectionRef.current = actualDir;
+          setContinuousJogDirection(
+            null
+          );
 
-    /*
-     * Highlight the PHYSICAL arrow being held.
-     */
-    setJogPressed(arrowDir === 1 ? 'LEFT' : 'RIGHT');
+          dispatch(
+            setJog(false)
+          );
 
-    /*
-     * Keep the existing physical direction state synchronized.
-     */
-    setDirection(arrowDir);
+          setAction(0);
 
-    console.log(
-      '[MANUAL-JOG] START',
-      'motor_dir=', motorDir,
-      'arrow=', arrowDir === 1 ? 'LEFT' : 'RIGHT',
-      'sent_dir=', actualDir,
-      'jog_feed=', jogFeed
+          return;
+        }
+
+        const actualDir =
+          jogDirectionRef.current !== null
+            ? jogDirectionRef.current
+            : 1;
+
+        jogActiveRef.current =
+          false;
+
+        jogDirectionRef.current =
+          null;
+
+        continuousJogDirectionRef.current =
+          null;
+
+        setContinuousJogDirection(
+          null
+        );
+
+        setJogPressed(
+          null
+        );
+
+        manualLog(
+          '[MANUAL-JOG] STOP',
+          'reason=',
+          reason,
+          'dir=',
+          actualDir
+        );
+
+        /*
+         * EXACT existing backend STOP contract.
+         */
+        handleSend(
+          'jog_mode',
+          {
+            "dir": actualDir,
+            "action": 0
+          }
+        );
+
+        dispatch(
+          setJog(false)
+        );
+
+        setAction(0);
+      },
+      [
+        handleSend,
+        dispatch
+      ]
     );
 
-    /*
-     * Existing jog_mode contract is preserved.
-     * Only jog_feed is additionally supplied.
-     */
-    handleSend(
-      'jog_mode',
-      {
-        "dir": actualDir,
-        "action": 1,
-        "jog_feed": jogFeed
+
+  /*
+   * ============================================================
+   * CONTINUOUS JOG START
+   * ============================================================
+   *
+   * Sends one START only.
+   *
+   * Finger release does NOT stop it.
+   */
+
+  const startContinuousJog =
+    useCallback(
+      (arrowDir) => {
+
+        if (
+          !continuousJogEnabledRef.current
+        ) {
+          return;
+        }
+
+        if (
+          mode !== 'JOG'
+        ) {
+          return;
+        }
+
+        if (
+          zeroref ||
+          emergency ||
+          reset
+        ) {
+          return;
+        }
+
+        const actualDir =
+          getActualDirection(
+            arrowDir
+          );
+
+        jogActiveRef.current =
+          true;
+
+        jogDirectionRef.current =
+          actualDir;
+
+        continuousJogDirectionRef.current =
+          arrowDir;
+
+        setContinuousJogDirection(
+          arrowDir
+        );
+
+        setJogPressed(
+          arrowDir === 1
+            ? 'LEFT'
+            : 'RIGHT'
+        );
+
+        setDirection(
+          arrowDir
+        );
+
+        manualLog(
+          '[CONTINUOUS-JOG] START',
+          arrowDir === 1
+            ? 'LEFT'
+            : 'RIGHT',
+          'feed=',
+          jogFeed
+        );
+
+        /*
+         * SAME backend START packet as normal jog.
+         */
+        handleSend(
+          'jog_mode',
+          {
+            "dir": actualDir,
+            "action": 1,
+            "jog_feed": jogFeed
+          }
+        );
+
+        dispatch(
+          setJog(true)
+        );
+
+        setAction(1);
+      },
+      [
+        mode,
+        zeroref,
+        emergency,
+        reset,
+        jogFeed,
+        getActualDirection,
+        handleSend,
+        dispatch
+      ]
+    );
+
+
+  /*
+   * ============================================================
+   * CONTINUOUS ARROW TAP
+   * ============================================================
+   *
+   * Example:
+   *
+   * stopped
+   *   tap LEFT
+   *   -> start LEFT
+   *
+   * LEFT running
+   *   tap LEFT
+   *   -> stop
+   *
+   * LEFT running
+   *   tap RIGHT
+   *   -> STOP LEFT
+   *   -> START RIGHT
+   *
+   * RIGHT behaves identically.
+   */
+
+  const handleContinuousJogPress =
+    useCallback(
+      (arrowDir) => {
+
+        if (
+          !continuousJogEnabledRef.current
+        ) {
+          return;
+        }
+
+        if (
+          mode !== 'JOG' ||
+          zeroref ||
+          emergency ||
+          reset
+        ) {
+          return;
+        }
+
+        const activeArrow =
+          continuousJogDirectionRef.current;
+
+
+        /*
+         * SAME ACTIVE ARROW PRESSED AGAIN
+         * -> toggle OFF.
+         */
+        if (
+          jogActiveRef.current &&
+          activeArrow === arrowDir
+        ) {
+
+          stopJog(
+            'CONTINUOUS_SAME_ARROW_STOP'
+          );
+
+          return;
+        }
+
+
+        /*
+         * OPPOSITE ARROW PRESSED
+         * -> stop current direction first.
+         */
+        if (
+          jogActiveRef.current &&
+          activeArrow !== null &&
+          activeArrow !== arrowDir
+        ) {
+
+          stopJog(
+            'CONTINUOUS_DIRECTION_SWITCH'
+          );
+        }
+
+
+        /*
+         * Start newly selected direction.
+         */
+        startContinuousJog(
+          arrowDir
+        );
+      },
+      [
+        mode,
+        zeroref,
+        emergency,
+        reset,
+        stopJog,
+        startContinuousJog
+      ]
+    );
+
+
+  /*
+   * ============================================================
+   * CONTINUOUS MODE ENABLE / DISABLE
+   * ============================================================
+   */
+
+  const disableContinuousJog =
+    useCallback(
+      (
+        reason =
+          'CONTINUOUS_MODE_DISABLED'
+      ) => {
+
+        if (
+          continuousJogEnabledRef.current &&
+          jogActiveRef.current
+        ) {
+
+          stopJog(
+            reason
+          );
+        }
+
+        continuousJogEnabledRef.current =
+          false;
+
+        continuousJogDirectionRef.current =
+          null;
+
+        setContinuousJogEnabled(
+          false
+        );
+
+        setContinuousJogDirection(
+          null
+        );
+
+        setJogPressed(
+          null
+        );
+      },
+      [
+        stopJog
+      ]
+    );
+
+
+  const toggleContinuousJog =
+    useCallback(
+      () => {
+
+        if (
+          mode !== 'JOG' ||
+          zeroref ||
+          emergency ||
+          reset
+        ) {
+          return;
+        }
+
+
+        /*
+         * Turn Continuous Jog OFF.
+         *
+         * If motor is running, STOP first.
+         */
+        if (
+          continuousJogEnabledRef.current
+        ) {
+
+          disableContinuousJog(
+            'CONTINUOUS_TOGGLE_OFF'
+          );
+
+          return;
+        }
+
+
+        /*
+         * Normal hold-to-run is currently active.
+         * Do not allow mode change during a held jog.
+         */
+        if (
+          jogActiveRef.current
+        ) {
+          return;
+        }
+
+
+        continuousJogEnabledRef.current =
+          true;
+
+        continuousJogDirectionRef.current =
+          null;
+
+        setContinuousJogEnabled(
+          true
+        );
+
+        setContinuousJogDirection(
+          null
+        );
+
+        setJogPressed(
+          null
+        );
+
+        manualLog(
+          '[CONTINUOUS-JOG] MODE ENABLED'
+        );
+      },
+      [
+        mode,
+        zeroref,
+        emergency,
+        reset,
+        disableContinuousJog
+      ]
+    );
+
+
+  /*
+   * Dedicated STOP JOG button.
+   */
+  const handleContinuousStop =
+    useCallback(
+      () => {
+
+        if (
+          !continuousJogEnabledRef.current
+        ) {
+          return;
+        }
+
+        stopJog(
+          'CONTINUOUS_STOP_BUTTON'
+        );
+      },
+      [
+        stopJog
+      ]
+    );
+
+
+  /*
+   * ============================================================
+   * STEP MODE
+   * ============================================================
+   *
+   * Existing logic preserved.
+   */
+
+  const executeStep =
+    useCallback(
+      (arrowDir) => {
+
+        if (
+          mode !== 'STEP'
+        ) {
+          return;
+        }
+
+        if (
+          moving
+        ) {
+
+          manualLog(
+            '[MANUAL-STEP] ignored - movement still active'
+          );
+
+          return;
+        }
+
+        if (
+          zeroref ||
+          emergency ||
+          reset
+        ) {
+          return;
+        }
+
+        const actualStepDir =
+          getActualDirection(
+            arrowDir
+          );
+
+        const actualStepPosition =
+          actualStepDir === 1
+            ? position
+            : 0 - position;
+
+        setDirection(
+          arrowDir
+        );
+
+        manualLog(
+          '[MANUAL-STEP]',
+          'motor_dir=',
+          motorDir,
+          'arrow=',
+          arrowDir === 1
+            ? 'LEFT'
+            : 'RIGHT',
+          'sent_dir=',
+          actualStepDir,
+          'position=',
+          actualStepPosition
+        );
+
+        handleSend(
+          'step_mode',
+          {
+            "drive_id": 1,
+            "position": actualStepPosition,
+            "dir": actualStepDir
+          }
+        );
+
+        setMoving(
+          true
+        );
+      },
+      [
+        mode,
+        moving,
+        zeroref,
+        emergency,
+        reset,
+        motorDir,
+        position,
+        getActualDirection,
+        handleSend
+      ]
+    );
+
+
+  /*
+   * ============================================================
+   * SAFETY STATE
+   * ============================================================
+   *
+   * Emergency / Reset / Zero Ref / leaving JOG:
+   *
+   * STOP motion and cancel Continuous Jog mode.
+   */
+
+  useEffect(
+    () => {
+
+      if (
+        emergency ||
+        reset ||
+        zeroref ||
+        mode !== 'JOG'
+      ) {
+
+        stopJog(
+          'SAFETY_STATE'
+        );
+
+        continuousJogEnabledRef.current =
+          false;
+
+        continuousJogDirectionRef.current =
+          null;
+
+        setContinuousJogEnabled(
+          false
+        );
+
+        setContinuousJogDirection(
+          null
+        );
       }
-    );
-
-    dispatch(setJog(true));
-    setAction(1);
-  }, [
-    mode,
-    zeroref,
-    emergency,
-    reset,
-    motorDir,
-    jogFeed,
-    getActualDirection,
-    handleSend,
-    dispatch
-  ]);
-
-  const stopJog = useCallback(() => {
-    /*
-     * If the local JOG ref is already cleared, still force
-     * the UI/Redux JOG state back to STOP.
-     *
-     * This prevents the JogSpeedometer from remaining
-     * disabled/locked until page refresh.
-     */
-    if (!jogActiveRef.current) {
-      setJogPressed(null);
-      dispatch(setJog(false));
-      setAction(0);
-      return;
-    }
-
-    const actualDir = jogDirectionRef.current !== null
-      ? jogDirectionRef.current
-      : 1;
-
-    /*
-     * Clear refs/state before socket emit so a second release
-     * cannot generate another STOP command.
-     */
-    jogActiveRef.current = false;
-    jogDirectionRef.current = null;
-    setJogPressed(null);
-
-    console.log(
-      '[MANUAL-JOG] STOP',
-      'dir=', actualDir
-    );
-
-    /*
-     * STOP contract remains unchanged.
-     */
-    handleSend(
-      'jog_mode',
-      {
-        "dir": actualDir,
-        "action": 0
-      }
-    );
-
-    /*
-     * Always clear the frontend JOG state after STOP so the
-     * speedometer unlocks immediately.
-     */
-    dispatch(setJog(false));
-    setAction(0);
-  }, [handleSend, dispatch]);
-
-  /*
-   * =====================================================
-   * STEP - PRESS ARROW TO MOVE ONE STEP
-   * =====================================================
-   *
-   * Select 0.1 / 0.01 / 0.001.
-   *
-   * Then:
-   * LEFT arrow release  -> execute one LEFT step
-   * RIGHT arrow release -> execute one RIGHT step
-   *
-   * There is NO MOVE button.
-   */
-  const executeStep = useCallback((arrowDir) => {
-    if (mode !== 'STEP') {
-      return;
-    }
-
-    /*
-     * Do not accept another STEP until the backend sends
-     * step_mode_completed for the current movement.
-     */
-    if (moving) {
-      console.log('[MANUAL-STEP] ignored - movement still active');
-      return;
-    }
-
-    if (zeroref || emergency || reset) {
-      return;
-    }
-
-    const actualStepDir = getActualDirection(arrowDir);
-
-    const actualStepPosition = actualStepDir === 1
-      ? position
-      : 0 - position;
-
-    setDirection(arrowDir);
-
-    console.log(
-      '[MANUAL-STEP]',
-      'motor_dir=', motorDir,
-      'arrow=', arrowDir === 1 ? 'LEFT' : 'RIGHT',
-      'sent_dir=', actualStepDir,
-      'position=', actualStepPosition
-    );
-
-    handleSend(
-      'step_mode',
-      {
-        "drive_id": 1,
-        "position": actualStepPosition,
-        "dir": actualStepDir
-      }
-    );
-
-    /*
-     * Block another STEP until step_mode_completed.
-     */
-    setMoving(true);
-  }, [
-    mode,
-    moving,
-    zeroref,
-    emergency,
-    reset,
-    motorDir,
-    position,
-    getActualDirection,
-    handleSend
-  ]);
-
-  /*
-   * If JOG becomes unavailable while an arrow is held,
-   * command STOP immediately.
-   */
-  useEffect(() => {
-    if (
-      emergency ||
-      reset ||
-      zeroref ||
-      mode !== 'JOG'
-    ) {
-      stopJog();
-    }
-  }, [
-    emergency,
-    reset,
-    zeroref,
-    mode,
-    stopJog
-  ]);
-
-  /*
-   * Emergency/Reset UI synchronization.
-   */
-  useEffect(() => {
-    if (emergency || reset) {
-      setAction(0);
-      setMoving(false);
-      setJogPressed(null);
-      setStepPressed(null);
-
-      jogActiveRef.current = false;
-      jogDirectionRef.current = null;
-
-      dispatch(setJog(false));
-    }
-  }, [
-    emergency,
-    reset,
-    dispatch
-  ]);
-
-  /*
-   * =====================================================
-   * GLOBAL RELEASE SAFETY FALLBACK
-   * =====================================================
-   *
-   * Keep:
-   * mouseup
-   * touchend
-   * blur
-   *
-   * IMPORTANT:
-   * touchcancel is deliberately NOT used because the
-   * Waveshare touchscreen can fire it during a valid
-   * continuous hold and prematurely stop JOG.
-   */
-  useEffect(() => {
-    if (typeof window === 'undefined') {
-      return undefined;
-    }
-
-    const releaseJog = () => {
-      if (jogActiveRef.current) {
-        console.log('[MANUAL-JOG] GLOBAL RELEASE');
-        stopJog();
-      }
-    };
-
-    window.addEventListener('mouseup', releaseJog);
-    // window.addEventListener('touchend', releaseJog);
-    window.addEventListener('blur', releaseJog);
-
-    return () => {
-      window.removeEventListener('mouseup', releaseJog);
-      // window.removeEventListener('touchend', releaseJog);
-      window.removeEventListener('blur', releaseJog);
-
-      stopJog();
-    };
-  }, [stopJog]);
-
-  const handleStep = useCallback(data => {
-    setMoving(false);
-  }, []);
-
-  const handleEnableEmergency = () => {
-    dispatch(setEmergency(false, reset, zeroref));
-  };
-
-  const handleEnableReset = () => {
-    dispatch(setEmergency(false, false, false));
-  };
-
-  const handleEnableZeroref = () => {
-    dispatch(setEmergency(emergency, reset, false));
-  };
-
-  useFocusEffect(
-    useCallback(() => {
-      setModal(running);
-    }, [running])
+    },
+    [
+      emergency,
+      reset,
+      zeroref,
+      mode,
+      stopJog
+    ]
   );
 
+
   /*
-   * Existing socket event listeners.
+   * Emergency / Reset UI synchronization.
    */
-  useEffect(() => {
-    socket.on("step_mode_completed", handleStep);
-    socket.on("gotozero_done", handleEnableZeroref);
-    socket.on("emergency_done", handleEnableEmergency);
-    socket.on("reset_done", handleEnableReset);
+  useEffect(
+    () => {
 
-    return () => {
-      socket.off("step_mode_completed", handleStep);
-      socket.off("gotozero_done", handleEnableZeroref);
-      socket.off("emergency_done", handleEnableEmergency);
-      socket.off("reset_done", handleEnableReset);
-    };
-  }, [
-    socket,
-    handleStep,
-    handleEnableReset,
-    handleEnableEmergency,
-    handleEnableZeroref
-  ]);
+      if (
+        emergency ||
+        reset
+      ) {
+
+        setAction(0);
+
+        setMoving(false);
+
+        setJogPressed(null);
+
+        setStepPressed(null);
+
+        jogActiveRef.current =
+          false;
+
+        jogDirectionRef.current =
+          null;
+
+        continuousJogEnabledRef.current =
+          false;
+
+        continuousJogDirectionRef.current =
+          null;
+
+        setContinuousJogEnabled(
+          false
+        );
+
+        setContinuousJogDirection(
+          null
+        );
+
+        dispatch(
+          setJog(false)
+        );
+      }
+    },
+    [
+      emergency,
+      reset,
+      dispatch
+    ]
+  );
+
 
   /*
-   * =====================================================
+   * ============================================================
+   * GLOBAL RELEASE SAFETY
+   * ============================================================
+   *
+   * NORMAL JOG:
+   *
+   * mouse release = STOP
+   *
+   * CONTINUOUS JOG:
+   *
+   * mouse release = DO NOTHING
+   *
+   * Browser/window blur ALWAYS stops for safety.
+   */
+
+  useEffect(
+    () => {
+
+      if (
+        typeof window === 'undefined'
+      ) {
+        return undefined;
+      }
+
+      const releaseJogFromMouse =
+        () => {
+
+          /*
+           * Existing normal hold-to-run safety only.
+           *
+           * Continuous Jog intentionally ignores finger/mouse release.
+           */
+          if (
+            jogActiveRef.current &&
+            !continuousJogEnabledRef.current
+          ) {
+
+            stopJog(
+              'GLOBAL_MOUSEUP'
+            );
+          }
+        };
+
+
+      const releaseJogFromBlur =
+        () => {
+
+          if (
+            jogActiveRef.current
+          ) {
+
+            stopJog(
+              'WINDOW_BLUR'
+            );
+          }
+
+          continuousJogEnabledRef.current =
+            false;
+
+          continuousJogDirectionRef.current =
+            null;
+
+          setContinuousJogEnabled(
+            false
+          );
+
+          setContinuousJogDirection(
+            null
+          );
+        };
+
+
+      window.addEventListener(
+        'mouseup',
+        releaseJogFromMouse
+      );
+
+      /*
+       * Do NOT add global touchend.
+       *
+       * Your Waveshare can emit unexpected touch-end behavior
+       * during existing normal hold-to-run operation.
+       */
+
+      window.addEventListener(
+        'blur',
+        releaseJogFromBlur
+      );
+
+
+      return () => {
+
+        window.removeEventListener(
+          'mouseup',
+          releaseJogFromMouse
+        );
+
+        window.removeEventListener(
+          'blur',
+          releaseJogFromBlur
+        );
+
+        stopJog(
+          'UNMOUNT'
+        );
+
+        continuousJogEnabledRef.current =
+          false;
+
+        continuousJogDirectionRef.current =
+          null;
+      };
+    },
+    [
+      stopJog
+    ]
+  );
+
+
+  /*
+   * ============================================================
+   * NAVIGATION BLUR SAFETY
+   * ============================================================
+   *
+   * If operator leaves Manual screen:
+   *
+   * stop jog
+   * cancel continuous mode
+   */
+
+  useFocusEffect(
+    useCallback(
+      () => {
+
+        return () => {
+
+          if (
+            jogActiveRef.current
+          ) {
+
+            stopJog(
+              'MANUAL_SCREEN_BLUR'
+            );
+          }
+
+          continuousJogEnabledRef.current =
+            false;
+
+          continuousJogDirectionRef.current =
+            null;
+
+          setContinuousJogEnabled(
+            false
+          );
+
+          setContinuousJogDirection(
+            null
+          );
+        };
+      },
+      [
+        stopJog
+      ]
+    )
+  );
+
+
+  /*
+   * ============================================================
+   * SOCKET DISCONNECT
+   * ============================================================
+   *
+   * Best-effort frontend stop / UI clearing.
+   *
+   * NOTE:
+   * True fail-safe network-loss stopping ultimately requires a
+   * backend/drive watchdog because once the socket is physically gone
+   * the browser cannot guarantee delivery of a STOP packet.
+   */
+
+  useEffect(
+    () => {
+
+      const handleSocketDisconnect =
+        () => {
+
+          if (
+            jogActiveRef.current
+          ) {
+
+            stopJog(
+              'SOCKET_DISCONNECT'
+            );
+          }
+
+          continuousJogEnabledRef.current =
+            false;
+
+          continuousJogDirectionRef.current =
+            null;
+
+          setContinuousJogEnabled(
+            false
+          );
+
+          setContinuousJogDirection(
+            null
+          );
+
+          setJogPressed(
+            null
+          );
+        };
+
+
+      socket.on(
+        'disconnect',
+        handleSocketDisconnect
+      );
+
+
+      return () => {
+
+        socket.off(
+          'disconnect',
+          handleSocketDisconnect
+        );
+      };
+    },
+    [
+      socket,
+      stopJog
+    ]
+  );
+
+
+  /*
+   * ============================================================
+   * EXISTING COMPLETION HANDLERS
+   * ============================================================
+   */
+
+  const handleStep =
+    useCallback(
+      () => {
+
+        setMoving(
+          false
+        );
+      },
+      []
+    );
+
+
+  const handleEnableEmergency =
+    useCallback(
+      () => {
+
+        dispatch(
+          setEmergency(
+            false,
+            reset,
+            zeroref
+          )
+        );
+      },
+      [
+        dispatch,
+        reset,
+        zeroref
+      ]
+    );
+
+
+  const handleEnableReset =
+    useCallback(
+      () => {
+
+        dispatch(
+          setEmergency(
+            false,
+            false,
+            false
+          )
+        );
+      },
+      [
+        dispatch
+      ]
+    );
+
+
+  const handleEnableZeroref =
+    useCallback(
+      () => {
+
+        dispatch(
+          setEmergency(
+            emergency,
+            reset,
+            false
+          )
+        );
+      },
+      [
+        dispatch,
+        emergency,
+        reset
+      ]
+    );
+
+
+  useFocusEffect(
+    useCallback(
+      () => {
+
+        setModal(
+          running
+        );
+      },
+      [
+        running
+      ]
+    )
+  );
+
+
+  /*
+   * Existing completion listeners.
+   */
+  useEffect(
+    () => {
+
+      socket.on(
+        "step_mode_completed",
+        handleStep
+      );
+
+      socket.on(
+        "gotozero_done",
+        handleEnableZeroref
+      );
+
+      socket.on(
+        "emergency_done",
+        handleEnableEmergency
+      );
+
+      socket.on(
+        "reset_done",
+        handleEnableReset
+      );
+
+
+      return () => {
+
+        socket.off(
+          "step_mode_completed",
+          handleStep
+        );
+
+        socket.off(
+          "gotozero_done",
+          handleEnableZeroref
+        );
+
+        socket.off(
+          "emergency_done",
+          handleEnableEmergency
+        );
+
+        socket.off(
+          "reset_done",
+          handleEnableReset
+        );
+      };
+    },
+    [
+      socket,
+      handleStep,
+      handleEnableReset,
+      handleEnableEmergency,
+      handleEnableZeroref
+    ]
+  );
+
+
+  /*
+   * ============================================================
    * LOAD MACHINE PARAMETERS
-   * =====================================================
-   *
-   * motor_dir:
-   * still controls the existing physical direction mapping.
-   *
-   * jog_feed:
-   * used only as the initial Manual-screen speedometer value.
-   * Manual speed changes are sent live with jog_mode and are
-   * NOT POSTed back to /dac_params.
+   * ============================================================
    */
-  const fetchData = async () => {
-    setLoading(true);
 
-    api.getJSON('dac_params')
-      .then(async (resJSON) => {
-        console.log('[MANUAL] dac_params =', resJSON);
+  const fetchData =
+    useCallback(
+      () => {
 
-        /*
-         * Existing behavior retained.
-         */
-        setZeroRef(true);
+        setLoading(
+          true
+        );
 
-        /*
-         * Support both response shapes already seen in this frontend:
-         *
-         * { resp: { A: {...} } }
-         * { A: {...} }
-         */
-        const settingsA =
-          resJSON && resJSON.resp && resJSON.resp.A
-            ? resJSON.resp.A
-            : (
-                resJSON && resJSON.A
-                  ? resJSON.A
-                  : null
+        api
+          .getJSON(
+            'dac_params'
+          )
+          .then(
+            async (
+              resJSON
+            ) => {
+
+              manualLog(
+                '[MANUAL] dac_params =',
+                resJSON
               );
 
-        /*
-         * Load existing motor_dir.
-         */
-        if (
-          settingsA &&
-          settingsA.motor_dir !== undefined &&
-          settingsA.motor_dir !== null
-        ) {
-          const loadedMotorDir = Number(settingsA.motor_dir);
+              setZeroRef(
+                true
+              );
 
-          if (loadedMotorDir === 0) {
-            setMotorDir(0);
 
-            console.log('[MANUAL] MOTOR DIR = 0 (-VE)');
-            console.log('[MANUAL] drive polarity handled by backend/YAML');
-            console.log('[MANUAL] frontend arrows remain LEFT=1 RIGHT=0');
-          } else {
-            setMotorDir(1);
+              const settingsA =
+                resJSON &&
+                resJSON.resp &&
+                resJSON.resp.A
+                  ? resJSON.resp.A
+                  : (
+                      resJSON &&
+                      resJSON.A
+                        ? resJSON.A
+                        : null
+                    );
 
-            console.log('[MANUAL] MOTOR DIR = 1 (+VE)');
-            console.log('[MANUAL] drive polarity handled by backend/YAML');
-            console.log('[MANUAL] frontend arrows remain LEFT=1 RIGHT=0');
-          }
-        } else {
-          setMotorDir(1);
-          console.warn('[MANUAL] motor_dir missing - defaulting to motor_dir=1');
-        }
 
-        /*
-         * Load existing Machine Parameter Jog Feed only as the
-         * initial Manual speedometer value.
-         */
-        if (
-          settingsA &&
-          settingsA.jog_feed !== undefined &&
-          settingsA.jog_feed !== null
-        ) {
-          const loadedJogFeed =
-            Math.max(
-              0,
-              Math.min(
-                20,
-                Number(
-                  settingsA.jog_feed
-                )
-              )
-            );
+              if (
+                settingsA &&
+                settingsA.motor_dir !== undefined &&
+                settingsA.motor_dir !== null
+              ) {
 
-          if (!Number.isNaN(loadedJogFeed)) {
-            setJogFeed(loadedJogFeed);
+                const loadedMotorDir =
+                  Number(
+                    settingsA.motor_dir
+                  );
 
-            /*
-             * Seed/refresh the backend shared Jog Feed from the
-             * existing Machine Parameter value when Manual opens.
-             * This does NOT write back to /dac_params.
-             */
-            socket.emit(
-              'set_jog_feed',
-              {
-                jog_feed: loadedJogFeed
+
+                if (
+                  loadedMotorDir === 0
+                ) {
+
+                  setMotorDir(
+                    0
+                  );
+
+                  manualLog(
+                    '[MANUAL] MOTOR DIR = 0 (-VE)'
+                  );
+
+                  manualLog(
+                    '[MANUAL] drive polarity handled by backend/YAML'
+                  );
+
+                  manualLog(
+                    '[MANUAL] frontend arrows remain LEFT=1 RIGHT=0'
+                  );
+
+                } else {
+
+                  setMotorDir(
+                    1
+                  );
+
+                  manualLog(
+                    '[MANUAL] MOTOR DIR = 1 (+VE)'
+                  );
+
+                  manualLog(
+                    '[MANUAL] drive polarity handled by backend/YAML'
+                  );
+
+                  manualLog(
+                    '[MANUAL] frontend arrows remain LEFT=1 RIGHT=0'
+                  );
+                }
+
+              } else {
+
+                setMotorDir(
+                  1
+                );
+
+                console.warn(
+                  '[MANUAL] motor_dir missing - defaulting to motor_dir=1'
+                );
               }
-            );
-          }
-        }
 
-        setLoading(false);
-      })
-      .catch((e) => {
-        console.log('[MANUAL] dac_params error:', e);
-        setLoading(false);
-      });
-  };
 
-  /*
-   * Reload Machine Parameters whenever Manual receives focus.
-   */
+              if (
+                settingsA &&
+                settingsA.jog_feed !== undefined &&
+                settingsA.jog_feed !== null
+              ) {
+
+                const loadedJogFeed =
+                  Math.max(
+                    0,
+                    Math.min(
+                      20,
+                      Number(
+                        settingsA.jog_feed
+                      )
+                    )
+                  );
+
+
+                if (
+                  !Number.isNaN(
+                    loadedJogFeed
+                  )
+                ) {
+
+                  /*
+                   * Initial value only.
+                   * No extra socket traffic.
+                   */
+                  setJogFeed(
+                    loadedJogFeed
+                  );
+                }
+              }
+
+
+              setLoading(
+                false
+              );
+            }
+          )
+          .catch(
+            (e) => {
+
+              manualLog(
+                '[MANUAL] dac_params error:',
+                e
+              );
+
+              setLoading(
+                false
+              );
+            }
+          );
+      },
+      []
+    );
+
+
   useFocusEffect(
-    React.useCallback(() => {
-      fetchData();
-    }, [])
+    useCallback(
+      () => {
+
+        fetchData();
+      },
+      [
+        fetchData
+      ]
+    )
   );
 
+
   /*
-   * Arrow active conditions.
+   * ============================================================
+   * ARROW DISPLAY STATE
+   * ============================================================
    */
+
   const leftArrowActive =
     mode === 'JOG'
       ? jogPressed === 'LEFT'
       : stepPressed === 'LEFT';
+
 
   const rightArrowActive =
     mode === 'JOG'
       ? jogPressed === 'RIGHT'
       : stepPressed === 'RIGHT';
 
+
+  const jogSpeedPercent =
+    Math.round(
+      (
+        jogFeed /
+        20
+      ) *
+      100
+    );
+
+
+  /*
+   * Toggle cannot be enabled during normal held-jog.
+   *
+   * But when Continuous mode itself is active, the toggle remains
+   * available so operator can disable it and stop.
+   */
+  const continuousPanelDisabled =
+    mode !== 'JOG' ||
+    zeroref ||
+    emergency ||
+    reset ||
+    (
+      jog &&
+      !continuousJogEnabled
+    );
+
+
+  /*
+   * ============================================================
+   * UI
+   * ============================================================
+   */
+
   return (
     <>
+
       <ImageBackground
         style={styles.imgBg}
         width={width}
-        source={require('../../img/bg.png')}
+        source={
+          require(
+            '../../img/bg.png'
+          )
+        }
       >
-        <View style={styles.containerStart}>
+
+        <View
+          style={styles.containerStart}
+        >
+
           <Stats
             location="MANUAL"
             navigation={navigation}
           />
+
 
           <View
             style={[
@@ -732,6 +1656,8 @@ const Manual = ({ navigation }) => {
               styles.flex1
             ]}
           >
+
+
             <View
               style={[
                 styles.flex3,
@@ -739,23 +1665,12 @@ const Manual = ({ navigation }) => {
                 styles.itemsStretch
               ]}
             >
-              {/*
-               * =================================================
-               * LEFT ARROW
-               *
-               * React Native Responder System is intentionally
-               * used instead of TouchableOpacity for the motion
-               * arrow itself.
-               *
-               * JOG:
-               * grant   -> START
-               * release -> STOP
-               *
-               * STEP:
-               * grant   -> show pressed arrow
-               * release -> execute exactly one STEP
-               * =================================================
-               */}
+
+
+              {/* =================================================
+                  LEFT ARROW
+                  ================================================= */}
+
               <View
                 style={[
                   styles.mr10,
@@ -765,65 +1680,194 @@ const Manual = ({ navigation }) => {
                     userSelect: 'none'
                   }
                 ]}
-                onStartShouldSetResponder={() => true}
-                onMoveShouldSetResponder={() => false}
-                onResponderGrant={() => {
-                  console.log('[MANUAL-RESPONDER] LEFT GRANT');
 
-                  if (mode === 'JOG') {
-                    startJog(1);
-                  } else if (mode === 'STEP') {
+                onStartShouldSetResponder={
+                  () => true
+                }
+
+                onMoveShouldSetResponder={
+                  () => false
+                }
+
+                onResponderGrant={
+                  () => {
+
+                    manualLog(
+                      '[MANUAL-RESPONDER] LEFT GRANT'
+                    );
+
+
                     if (
-                      !moving &&
-                      !zeroref &&
-                      !emergency &&
-                      !reset
+                      mode === 'JOG'
                     ) {
-                      setDirection(1);
-                      setStepPressed('LEFT');
+
+                      /*
+                       * NEW CONTINUOUS MODE:
+                       *
+                       * one tap toggles / switches.
+                       */
+                      if (
+                        continuousJogEnabledRef.current
+                      ) {
+
+                        handleContinuousJogPress(
+                          1
+                        );
+
+                      } else {
+
+                        /*
+                         * EXISTING HOLD-TO-RUN.
+                         */
+                        startJog(
+                          1
+                        );
+                      }
+
+                    } else if (
+                      mode === 'STEP'
+                    ) {
+
+                      if (
+                        !moving &&
+                        !zeroref &&
+                        !emergency &&
+                        !reset
+                      ) {
+
+                        setDirection(
+                          1
+                        );
+
+                        setStepPressed(
+                          'LEFT'
+                        );
+                      }
                     }
                   }
-                }}
-                onResponderRelease={() => {
-                  console.log('[MANUAL-RESPONDER] LEFT RELEASE');
+                }
 
-                  if (mode === 'JOG') {
-                    stopJog();
-                  } else if (mode === 'STEP') {
-                    setStepPressed(null);
-                    executeStep(1);
-                  }
-                }}
-                onResponderTerminationRequest={() => {
-                  /*
-                   * Never allow the browser to steal the responder
-                   * while a live JOG command is active.
-                   */
-                  if (jogActiveRef.current) {
-                    console.log('[MANUAL-RESPONDER] LEFT KEEP RESPONDER');
-                    return false;
-                  }
 
-                  return true;
-                }}
-                onResponderTerminate={() => {
-                  console.log('[MANUAL-RESPONDER] LEFT TERMINATED');
+                onResponderRelease={
+                  () => {
 
-                  if (mode === 'JOG') {
-                    stopJog();
-                  } else if (mode === 'STEP') {
-                    setStepPressed(null);
+                    manualLog(
+                      '[MANUAL-RESPONDER] LEFT RELEASE'
+                    );
+
+
+                    if (
+                      mode === 'JOG'
+                    ) {
+
+                      /*
+                       * Continuous Jog:
+                       * release intentionally does NOTHING.
+                       *
+                       * Normal Jog:
+                       * preserve existing STOP-on-release.
+                       */
+                      if (
+                        !continuousJogEnabledRef.current
+                      ) {
+
+                        stopJog(
+                          'LEFT_RELEASE'
+                        );
+                      }
+
+                    } else if (
+                      mode === 'STEP'
+                    ) {
+
+                      setStepPressed(
+                        null
+                      );
+
+                      executeStep(
+                        1
+                      );
+                    }
                   }
-                }}
+                }
+
+
+                onResponderTerminationRequest={
+                  () => {
+
+                    /*
+                     * Existing normal hold jog must keep responder
+                     * until release.
+                     */
+                    if (
+                      jogActiveRef.current &&
+                      !continuousJogEnabledRef.current
+                    ) {
+
+                      manualLog(
+                        '[MANUAL-RESPONDER] LEFT KEEP RESPONDER'
+                      );
+
+                      return false;
+                    }
+
+                    return true;
+                  }
+                }
+
+
+                onResponderTerminate={
+                  () => {
+
+                    manualLog(
+                      '[MANUAL-RESPONDER] LEFT TERMINATED'
+                    );
+
+
+                    if (
+                      mode === 'JOG'
+                    ) {
+
+                      /*
+                       * Termination is treated as safety event,
+                       * even in Continuous mode.
+                       */
+                      if (
+                        jogActiveRef.current
+                      ) {
+
+                        stopJog(
+                          'LEFT_TERMINATED'
+                        );
+                      }
+
+                    } else if (
+                      mode === 'STEP'
+                    ) {
+
+                      setStepPressed(
+                        null
+                      );
+                    }
+                  }
+                }
               >
+
                 <LinearGradient
                   colors={
                     leftArrowActive
-                      ? [COLORS.ctrlActive1, COLORS.ctrlActive2]
-                      : [COLORS.ctrlInactive1, COLORS.ctrlInactive2]
+                      ? [
+                          COLORS.ctrlActive1,
+                          COLORS.ctrlActive2
+                        ]
+                      : [
+                          COLORS.ctrlInactive1,
+                          COLORS.ctrlInactive2
+                        ]
                   }
                   style={styles.manualInner}
                 >
+
                   <svg
                     className="dirIcon"
                     width="68"
@@ -836,28 +1880,41 @@ const Manual = ({ navigation }) => {
                       userSelect: 'none'
                     }}
                   >
+
                     <g
                       transform="translate(-109.000000, -33.000000)"
-                      fill={leftArrowActive ? "#2891B9" : "#FFFFFF33"}
+                      fill={
+                        leftArrowActive
+                          ? "#2891B9"
+                          : "#FFFFFF33"
+                      }
                     >
+
                       <path
                         d="M109,61.0740898 L179.093363,33 L189,109.212617 L169.306005,97.5499239 C160.875838,112.352739 158.130953,127.725392 161.071348,143.667884 C164.011744,159.610376 173.321294,173.207619 189,184.459613 L170.541039,229 C138.516464,213.22728 119.072998,189.319536 112.210642,157.276768 C105.348286,125.234001 109.677573,97.1084378 125.198504,72.9000792 L109,61.0740898 Z"
                         id="arrow-l"
                       />
+
                     </g>
+
                   </svg>
+
                 </LinearGradient>
+
               </View>
 
-              {/*
-               * CENTER
-               */}
+
+              {/* =================================================
+                  CENTER - SPEED / ZERO REF
+                  ================================================= */}
+
               <View
                 style={[
                   styles.itemsCenter,
                   styles.justifyCenter
                 ]}
               >
+
                 <View
                   style={{
                     width: 280,
@@ -867,48 +1924,95 @@ const Manual = ({ navigation }) => {
                     marginBottom: 8
                   }}
                 >
-                  <JogSpeedometer
-                    value={jogFeed}
-                    disabled={
-                      mode !== 'JOG' ||
-                      jog ||
-                      zeroref ||
-                      emergency ||
-                      reset
-                    }
-                    onChange={(newJogFeed) => {
-                      const safeJogFeed =
-                        Number(
-                          Number(newJogFeed).toFixed(6)
-                        );
 
-                      if (
-                        !Number.isNaN(safeJogFeed) &&
-                        safeJogFeed >= 0 &&
-                        safeJogFeed <= 20
-                      ) {
-                        /*
-                         * Update this UI immediately.
-                         */
-                        setJogFeed(currentJogFeed => {
-                          if (currentJogFeed === safeJogFeed) {
-                            return currentJogFeed;
+                  {jog ? (
+
+                    /*
+                     * PERFORMANCE:
+                     *
+                     * Do not keep repainting the SVG speedometer while
+                     * table is continuously moving.
+                     */
+                    <LinearGradient
+                      colors={[
+                        '#34393D',
+                        '#24292D',
+                        '#0D0F11'
+                      ]}
+                      style={{
+                        width: 280,
+                        minHeight: 300,
+                        borderWidth: 1,
+                        borderColor: '#3A4145',
+                        borderRadius: 10,
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        padding: 16
+                      }}
+                    >
+
+                      <Text
+                        style={styles.title1}
+                      >
+                        {
+                          continuousJogEnabled
+                            ? 'CONTINUOUS JOG ACTIVE'
+                            : 'JOG ACTIVE'
+                        }
+                      </Text>
+
+
+                      <Text
+                        style={[
+                          styles.body1,
+                          styles.mt20,
+                          {
+                            color: '#37C1F5',
+                            textAlign: 'center'
                           }
+                        ]}
+                      >
+                        SPEED {jogSpeedPercent}%
+                      </Text>
 
-                          return safeJogFeed;
-                        });
 
-                        /*
-                         * Mirror only the selected speed value to all
-                         * connected Manual screens through the backend.
-                         * Outbound mirror packets are throttled during drag
-                         * to reduce UI/socket load; the final value is kept.
-                         */
-                        emitJogFeedMirror(safeJogFeed);
+                      <Text
+                        style={[
+                          styles.body3,
+                          styles.mt10,
+                          {
+                            textAlign: 'center'
+                          }
+                        ]}
+                      >
+                        {
+                          continuousJogEnabled
+                            ? 'TAP ACTIVE ARROW AGAIN OR PRESS STOP JOG'
+                            : 'RELEASE ARROW TO STOP'
+                        }
+                      </Text>
+
+                    </LinearGradient>
+
+                  ) : (
+
+                    <JogSpeedometer
+                      value={jogFeed}
+                      disabled={
+                        mode !== 'JOG' ||
+                        zeroref ||
+                        emergency ||
+                        reset
                       }
-                    }}
-                  />
+                      onChange={
+                        handleJogFeedChange
+                      }
+                    />
+
+                  )}
+
                 </View>
+
 
                 <TouchableOpacity
                   style={[
@@ -933,11 +2037,25 @@ const Manual = ({ navigation }) => {
                     reset ||
                     zeroref
                   }
-                  onPress={() => {
-                    handleSend('goToZero', {});
-                    dispatch(setEmergency(false, false, true));
-                  }}
+                  onPress={
+                    () => {
+
+                      handleSend(
+                        'goToZero',
+                        {}
+                      );
+
+                      dispatch(
+                        setEmergency(
+                          false,
+                          false,
+                          true
+                        )
+                      );
+                    }
+                  }
                 >
+
                   <LinearGradient
                     colors={[
                       COLORS.gray1,
@@ -945,18 +2063,24 @@ const Manual = ({ navigation }) => {
                     ]}
                     style={styles.btn}
                   >
-                    <Text style={styles.btnTxtRed}>
+
+                    <Text
+                      style={styles.btnTxtRed}
+                    >
                       ZERO REF
                     </Text>
+
                   </LinearGradient>
+
                 </TouchableOpacity>
+
               </View>
 
-              {/*
-               * =================================================
-               * RIGHT ARROW
-               * =================================================
-               */}
+
+              {/* =================================================
+                  RIGHT ARROW
+                  ================================================= */}
+
               <View
                 style={[
                   styles.ml10,
@@ -966,61 +2090,171 @@ const Manual = ({ navigation }) => {
                     userSelect: 'none'
                   }
                 ]}
-                onStartShouldSetResponder={() => true}
-                onMoveShouldSetResponder={() => false}
-                onResponderGrant={() => {
-                  console.log('[MANUAL-RESPONDER] RIGHT GRANT');
 
-                  if (mode === 'JOG') {
-                    startJog(0);
-                  } else if (mode === 'STEP') {
+                onStartShouldSetResponder={
+                  () => true
+                }
+
+                onMoveShouldSetResponder={
+                  () => false
+                }
+
+                onResponderGrant={
+                  () => {
+
+                    manualLog(
+                      '[MANUAL-RESPONDER] RIGHT GRANT'
+                    );
+
+
                     if (
-                      !moving &&
-                      !zeroref &&
-                      !emergency &&
-                      !reset
+                      mode === 'JOG'
                     ) {
-                      setDirection(0);
-                      setStepPressed('RIGHT');
+
+                      if (
+                        continuousJogEnabledRef.current
+                      ) {
+
+                        handleContinuousJogPress(
+                          0
+                        );
+
+                      } else {
+
+                        startJog(
+                          0
+                        );
+                      }
+
+                    } else if (
+                      mode === 'STEP'
+                    ) {
+
+                      if (
+                        !moving &&
+                        !zeroref &&
+                        !emergency &&
+                        !reset
+                      ) {
+
+                        setDirection(
+                          0
+                        );
+
+                        setStepPressed(
+                          'RIGHT'
+                        );
+                      }
                     }
                   }
-                }}
-                onResponderRelease={() => {
-                  console.log('[MANUAL-RESPONDER] RIGHT RELEASE');
+                }
 
-                  if (mode === 'JOG') {
-                    stopJog();
-                  } else if (mode === 'STEP') {
-                    setStepPressed(null);
-                    executeStep(0);
-                  }
-                }}
-                onResponderTerminationRequest={() => {
-                  if (jogActiveRef.current) {
-                    console.log('[MANUAL-RESPONDER] RIGHT KEEP RESPONDER');
-                    return false;
-                  }
 
-                  return true;
-                }}
-                onResponderTerminate={() => {
-                  console.log('[MANUAL-RESPONDER] RIGHT TERMINATED');
+                onResponderRelease={
+                  () => {
 
-                  if (mode === 'JOG') {
-                    stopJog();
-                  } else if (mode === 'STEP') {
-                    setStepPressed(null);
+                    manualLog(
+                      '[MANUAL-RESPONDER] RIGHT RELEASE'
+                    );
+
+
+                    if (
+                      mode === 'JOG'
+                    ) {
+
+                      if (
+                        !continuousJogEnabledRef.current
+                      ) {
+
+                        stopJog(
+                          'RIGHT_RELEASE'
+                        );
+                      }
+
+                    } else if (
+                      mode === 'STEP'
+                    ) {
+
+                      setStepPressed(
+                        null
+                      );
+
+                      executeStep(
+                        0
+                      );
+                    }
                   }
-                }}
+                }
+
+
+                onResponderTerminationRequest={
+                  () => {
+
+                    if (
+                      jogActiveRef.current &&
+                      !continuousJogEnabledRef.current
+                    ) {
+
+                      manualLog(
+                        '[MANUAL-RESPONDER] RIGHT KEEP RESPONDER'
+                      );
+
+                      return false;
+                    }
+
+                    return true;
+                  }
+                }
+
+
+                onResponderTerminate={
+                  () => {
+
+                    manualLog(
+                      '[MANUAL-RESPONDER] RIGHT TERMINATED'
+                    );
+
+
+                    if (
+                      mode === 'JOG'
+                    ) {
+
+                      if (
+                        jogActiveRef.current
+                      ) {
+
+                        stopJog(
+                          'RIGHT_TERMINATED'
+                        );
+                      }
+
+                    } else if (
+                      mode === 'STEP'
+                    ) {
+
+                      setStepPressed(
+                        null
+                      );
+                    }
+                  }
+                }
               >
+
                 <LinearGradient
                   colors={
                     rightArrowActive
-                      ? [COLORS.ctrlActive1, COLORS.ctrlActive2]
-                      : [COLORS.ctrlInactive1, COLORS.ctrlInactive2]
+                      ? [
+                          COLORS.ctrlActive1,
+                          COLORS.ctrlActive2
+                        ]
+                      : [
+                          COLORS.ctrlInactive1,
+                          COLORS.ctrlInactive2
+                        ]
                   }
                   style={styles.manualInner}
                 >
+
                   <svg
                     className="dirIcon"
                     width="68"
@@ -1033,20 +2267,36 @@ const Manual = ({ navigation }) => {
                       userSelect: 'none'
                     }}
                   >
+
                     <g
                       transform="translate(-254.000000, -33.000000)"
-                      fill={rightArrowActive ? "#2891B9" : "#FFFFFF33"}
+                      fill={
+                        rightArrowActive
+                          ? "#2891B9"
+                          : "#FFFFFF33"
+                      }
                     >
+
                       <path
                         d="M254,61.0740898 L324.093363,33 L334,109.212617 L314.306005,97.5499239 C305.875838,112.352739 303.130953,127.725392 306.071348,143.667884 C309.011744,159.610376 318.321294,173.207619 334,184.459613 L315.541039,229 C283.516464,213.22728 264.072998,189.319536 257.210642,157.276768 C250.348286,125.234001 254.677573,97.1084378 270.198504,72.9000792 L254,61.0740898 Z"
                         id="arrow-r"
                         transform="translate(294.000000, 131.000000) scale(-1, 1) translate(-294.000000, -131.000000)"
                       />
+
                     </g>
+
                   </svg>
+
                 </LinearGradient>
+
               </View>
+
             </View>
+
+
+            {/* ===================================================
+                RIGHT SIDE CONTROL COLUMN
+                =================================================== */}
 
             <View
               style={[
@@ -1054,11 +2304,10 @@ const Manual = ({ navigation }) => {
                 styles.justifyStart
               ]}
             >
-              {/*
-               * =================================================
-               * JOG / STEP SELECTOR
-               * =================================================
-               */}
+
+
+              {/* JOG / STEP */}
+
               <View
                 style={[
                   styles.rowCenter,
@@ -1066,6 +2315,7 @@ const Manual = ({ navigation }) => {
                   styles.mb10
                 ]}
               >
+
                 <TouchableOpacity
                   style={[
                     styles.flex1,
@@ -1083,25 +2333,49 @@ const Manual = ({ navigation }) => {
                     zeroref ||
                     reset
                   }
-                  onPress={() => {
-                    setMode('JOG');
-                    setJogPressed(null);
-                    setStepPressed(null);
-                  }}
+                  onPress={
+                    () => {
+
+                      setMode(
+                        'JOG'
+                      );
+
+                      setJogPressed(
+                        null
+                      );
+
+                      setStepPressed(
+                        null
+                      );
+                    }
+                  }
                 >
+
                   <LinearGradient
                     colors={
                       mode === 'JOG'
-                        ? [COLORS.green1, COLORS.green2]
-                        : ['#0000', '#0000']
+                        ? [
+                            COLORS.green1,
+                            COLORS.green2
+                          ]
+                        : [
+                            '#0000',
+                            '#0000'
+                          ]
                     }
                     style={styles.btn0}
                   >
-                    <Text style={styles.btnTxtRed}>
+
+                    <Text
+                      style={styles.btnTxtRed}
+                    >
                       JOG
                     </Text>
+
                   </LinearGradient>
+
                 </TouchableOpacity>
+
 
                 <TouchableOpacity
                   style={[
@@ -1124,54 +2398,108 @@ const Manual = ({ navigation }) => {
                     zeroref ||
                     reset
                   }
-                  onPress={() => {
-                    /*
-                     * Ensure a possible JOG is stopped before switching.
-                     */
-                    stopJog();
+                  onPress={
+                    () => {
 
-                    handleSend(
-                      'enable_step_mode',
-                      {
-                        "status": "1"
-                      }
-                    );
+                      /*
+                       * If Continuous mode was enabled but idle,
+                       * switching to STEP cancels it.
+                       */
+                      disableContinuousJog(
+                        'MODE_SWITCH_STEP'
+                      );
 
-                    setJogPressed(null);
-                    setStepPressed(null);
-                    setMode('STEP');
-                  }}
+                      stopJog(
+                        'MODE_SWITCH_STEP'
+                      );
+
+                      handleSend(
+                        'enable_step_mode',
+                        {
+                          "status": "1"
+                        }
+                      );
+
+                      setJogPressed(
+                        null
+                      );
+
+                      setStepPressed(
+                        null
+                      );
+
+                      setMode(
+                        'STEP'
+                      );
+                    }
+                  }
                 >
+
                   <LinearGradient
                     colors={
                       mode === 'STEP'
-                        ? [COLORS.green1, COLORS.green2]
-                        : ['#0000', '#0000']
+                        ? [
+                            COLORS.green1,
+                            COLORS.green2
+                          ]
+                        : [
+                            '#0000',
+                            '#0000'
+                          ]
                     }
                     style={styles.btn0}
                   >
-                    <Text style={styles.btnTxtRed}>
+
+                    <Text
+                      style={styles.btnTxtRed}
+                    >
                       STEP
                     </Text>
+
                   </LinearGradient>
+
                 </TouchableOpacity>
+
               </View>
 
-              {/*
-               * =================================================
-               * STEP MODE
-               * =================================================
-               *
-               * Select increment only.
-               *
-               * MOVE button is intentionally removed.
-               *
-               * Press/release LEFT or RIGHT arrow to execute
-               * one STEP directly.
-               * =================================================
-               */}
-              {mode === 'STEP' &&
+
+              {/* =================================================
+                  CONTINUOUS JOG PANEL
+                  ================================================= */}
+
+              {
+                mode === 'JOG' &&
+                <ContinuousJogPanel
+                  enabled={
+                    continuousJogEnabled
+                  }
+                  activeDirection={
+                    continuousJogDirection
+                  }
+                  speedPercent={
+                    jogSpeedPercent
+                  }
+                  disabled={
+                    continuousPanelDisabled
+                  }
+                  onToggle={
+                    toggleContinuousJog
+                  }
+                  onStop={
+                    handleContinuousStop
+                  }
+                />
+              }
+
+
+              {/* =================================================
+                  EXISTING STEP SELECTION
+                  ================================================= */}
+
+              {
+                mode === 'STEP' &&
                 <>
+
                   <View
                     style={[
                       styles.rowCenter,
@@ -1179,8 +2507,11 @@ const Manual = ({ navigation }) => {
                       styles.mb10
                     ]}
                   >
+
                     <TouchableOpacity
-                      disabled={zeroref}
+                      disabled={
+                        zeroref
+                      }
                       style={[
                         styles.flex1,
                         {
@@ -1190,26 +2521,46 @@ const Manual = ({ navigation }) => {
                               : 1
                         }
                       ]}
-                      onPress={() => {
-                        setPosition(0.1);
-                      }}
+                      onPress={
+                        () => {
+
+                          setPosition(
+                            0.1
+                          );
+                        }
+                      }
                     >
+
                       <LinearGradient
                         colors={
                           position === 0.1
-                            ? [COLORS.green1, COLORS.green2]
-                            : ['#0000', '#0000']
+                            ? [
+                                COLORS.green1,
+                                COLORS.green2
+                              ]
+                            : [
+                                '#0000',
+                                '#0000'
+                              ]
                         }
                         style={styles.btn0}
                       >
-                        <Text style={styles.btnTxtRed}>
+
+                        <Text
+                          style={styles.btnTxtRed}
+                        >
                           0.1
                         </Text>
+
                       </LinearGradient>
+
                     </TouchableOpacity>
 
+
                     <TouchableOpacity
-                      disabled={zeroref}
+                      disabled={
+                        zeroref
+                      }
                       style={[
                         styles.flex1,
                         {
@@ -1219,26 +2570,46 @@ const Manual = ({ navigation }) => {
                               : 1
                         }
                       ]}
-                      onPress={() => {
-                        setPosition(0.01);
-                      }}
+                      onPress={
+                        () => {
+
+                          setPosition(
+                            0.01
+                          );
+                        }
+                      }
                     >
+
                       <LinearGradient
                         colors={
                           position === 0.01
-                            ? [COLORS.green1, COLORS.green2]
-                            : ['#0000', '#0000']
+                            ? [
+                                COLORS.green1,
+                                COLORS.green2
+                              ]
+                            : [
+                                '#0000',
+                                '#0000'
+                              ]
                         }
                         style={styles.btn0}
                       >
-                        <Text style={styles.btnTxtRed}>
+
+                        <Text
+                          style={styles.btnTxtRed}
+                        >
                           0.01
                         </Text>
+
                       </LinearGradient>
+
                     </TouchableOpacity>
 
+
                     <TouchableOpacity
-                      disabled={zeroref}
+                      disabled={
+                        zeroref
+                      }
                       style={[
                         styles.flex1,
                         {
@@ -1248,46 +2619,84 @@ const Manual = ({ navigation }) => {
                               : 1
                         }
                       ]}
-                      onPress={() => {
-                        setPosition(0.001);
-                      }}
+                      onPress={
+                        () => {
+
+                          setPosition(
+                            0.001
+                          );
+                        }
+                      }
                     >
+
                       <LinearGradient
                         colors={
                           position === 0.001
-                            ? [COLORS.green1, COLORS.green2]
-                            : ['#0000', '#0000']
+                            ? [
+                                COLORS.green1,
+                                COLORS.green2
+                              ]
+                            : [
+                                '#0000',
+                                '#0000'
+                              ]
                         }
                         style={styles.btn0}
                       >
-                        <Text style={styles.btnTxtRed}>
+
+                        <Text
+                          style={styles.btnTxtRed}
+                        >
                           0.001
                         </Text>
+
                       </LinearGradient>
+
                     </TouchableOpacity>
+
                   </View>
+
                 </>
               }
+
             </View>
+
           </View>
+
         </View>
+
       </ImageBackground>
 
-      {modal &&
-        <View style={styles.overlayWrap}>
-          <View style={styles.overlayInner}>
+
+      {/* =========================================================
+          EXISTING AUTO MODE OVERLAY
+          ========================================================= */}
+
+      {
+        modal &&
+
+        <View
+          style={styles.overlayWrap}
+        >
+
+          <View
+            style={styles.overlayInner}
+          >
+
             <View
               style={[
                 styles.rowCenter,
                 styles.mb25
               ]}
             >
+
               <Ionicons
                 name="ios-alert-circle"
                 size={20}
                 color="#fffa"
                 style={styles.mr10}
               />
+
 
               <Text
                 style={[
@@ -1297,17 +2706,28 @@ const Manual = ({ navigation }) => {
                   }
                 ]}
               >
+
                 System is in auto mode. Please stop the program to visit Manual screen.
+
               </Text>
+
             </View>
 
-            <View style={styles.rowCenter}>
+
+            <View
+              style={styles.rowCenter}
+            >
+
               <TouchableOpacity
                 style={styles.mr15}
-                onPress={() => {
-                  navigation.goBack();
-                }}
+                onPress={
+                  () => {
+
+                    navigation.goBack();
+                  }
+                }
               >
+
                 <LinearGradient
                   colors={[
                     COLORS.blue1,
@@ -1315,23 +2735,33 @@ const Manual = ({ navigation }) => {
                   ]}
                   style={styles.btn}
                 >
-                  <Text style={styles.btnTxtRed}>
+
+                  <Text
+                    style={styles.btnTxtRed}
+                  >
                     BACK
                   </Text>
+
                 </LinearGradient>
+
               </TouchableOpacity>
+
 
               <TouchableOpacity
                 style={{}}
-                onPress={() => {
-                  navigation.navigate(
-                    'AutoScreens',
-                    {
-                      screen: 'Auto'
-                    }
-                  );
-                }}
+                onPress={
+                  () => {
+
+                    navigation.navigate(
+                      'AutoScreens',
+                      {
+                        screen: 'Auto'
+                      }
+                    );
+                  }
+                }
               >
+
                 <LinearGradient
                   colors={[
                     COLORS.blue1,
@@ -1339,17 +2769,27 @@ const Manual = ({ navigation }) => {
                   ]}
                   style={styles.btn}
                 >
-                  <Text style={styles.btnTxtRed}>
+
+                  <Text
+                    style={styles.btnTxtRed}
+                  >
                     AUTO
                   </Text>
+
                 </LinearGradient>
+
               </TouchableOpacity>
+
             </View>
+
           </View>
+
         </View>
       }
+
     </>
   );
 };
+
 
 export default Manual;

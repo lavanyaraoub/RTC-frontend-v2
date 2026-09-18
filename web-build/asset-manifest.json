@@ -1,7 +1,7 @@
 {
   "files": {
-    "main.js": "/static/js/main.1b46cda4.js",
-    "static/js/21.1f7b6202.js": "/static/js/21.1f7b6202.js",
+    "main.js": "/static/js/main.fca18981.js",
+    "static/js/21.b91b9b55.js": "/static/js/21.b91b9b55.js",
     "static/media/MaterialCommunityIcons.ttf": "/static/media/MaterialCommunityIcons.a7629910d13716b7080c.ttf",
     "static/media/Arimo-SemiBold.ttf": "/static/media/Arimo-SemiBold.e42418ac393d39450f56.ttf",
     "static/media/Arimo-Medium.ttf": "/static/media/Arimo-Medium.595e68479fad02df8321.ttf",
@@ -31,11 +31,11 @@
     "favicon-16.png": "/favicon-16.png",
     "manifest.json": "/manifest.json",
     "serve.json": "/serve.json",
-    "main.1b46cda4.js.map": "/static/js/main.1b46cda4.js.map",
-    "21.1f7b6202.js.map": "/static/js/21.1f7b6202.js.map"
+    "main.fca18981.js.map": "/static/js/main.fca18981.js.map",
+    "21.b91b9b55.js.map": "/static/js/21.b91b9b55.js.map"
   },
   "entrypoints": [
-    "static/js/21.1f7b6202.js",
-    "static/js/main.1b46cda4.js"
+    "static/js/21.b91b9b55.js",
+    "static/js/main.fca18981.js"
   ]
 }
