@@ -1,6 +1,6 @@
 {
   "files": {
-    "main.js": "/static/js/main.b5ec5b0b.js",
+    "main.js": "/static/js/main.a685191f.js",
     "static/js/21.b91b9b55.js": "/static/js/21.b91b9b55.js",
     "static/media/MaterialCommunityIcons.ttf": "/static/media/MaterialCommunityIcons.a7629910d13716b7080c.ttf",
     "static/media/Arimo-SemiBold.ttf": "/static/media/Arimo-SemiBold.e42418ac393d39450f56.ttf",
@@ -31,11 +31,11 @@
     "favicon-16.png": "/favicon-16.png",
     "manifest.json": "/manifest.json",
     "serve.json": "/serve.json",
-    "main.b5ec5b0b.js.map": "/static/js/main.b5ec5b0b.js.map",
+    "main.a685191f.js.map": "/static/js/main.a685191f.js.map",
     "21.b91b9b55.js.map": "/static/js/21.b91b9b55.js.map"
   },
   "entrypoints": [
     "static/js/21.b91b9b55.js",
-    "static/js/main.b5ec5b0b.js"
+    "static/js/main.a685191f.js"
   ]
 }

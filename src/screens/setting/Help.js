@@ -32,6 +32,18 @@ const Help = ({navigation}) => {
           }
       }
     }, []);
+
+  const handleSystemNotice = useCallback((data) => {
+      const notice =
+          data && data.data !== undefined
+              ? data.data
+              : data;
+
+      if(notice) {
+          setError(true);
+          setMsg(notice);
+      }
+    }, []);  
   
   const fetchData = async() => {
     setLoading(true);
@@ -64,10 +76,13 @@ const Help = ({navigation}) => {
 
   useEffect(()=>{
       socket.on("alarm_error", handleAlarm);
+      socket.on("system_notice", handleSystemNotice);
+
       return () => {
           socket.off("alarm_error", handleAlarm);
+          socket.off("system_notice", handleSystemNotice);
       };
-  }, [socket, handleAlarm]);
+  }, [socket, handleAlarm, handleSystemNotice]);
 
   
   return (
